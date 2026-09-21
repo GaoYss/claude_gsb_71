@@ -57,7 +57,9 @@
         <el-table-column label="操作" width="260" fixed="right">
           <template #default="{ row }">
             <el-button link type="primary" @click="openDetail(row)">详情</el-button>
-            <el-button v-if="isOpen(row)" link type="warning" @click="openRepair(row)">维修录入</el-button>
+            <el-button v-if="row.status !== 'closed'" link type="warning" @click="openRepair(row)">
+              {{ row.status === 'repaired' ? '返修/补录' : '维修录入' }}
+            </el-button>
             <el-button v-if="row.status !== 'closed'" link type="primary" @click="openEdit(row)">编辑</el-button>
             <el-button v-if="row.status !== 'closed'" link type="info" @click="handleClose(row)">关闭</el-button>
             <el-button v-if="row.status === 'closed'" link type="danger" @click="handleDelete(row)">删除</el-button>
@@ -127,8 +129,6 @@ const editing = ref(null)
 const presetLamp = ref(null)
 const repairTarget = ref(null)
 const activeFaultId = ref(null)
-
-const isOpen = (row) => row.status === 'pending' || row.status === 'processing'
 
 // 日期区间变化时同步到查询条件。
 function applyDateRange() {

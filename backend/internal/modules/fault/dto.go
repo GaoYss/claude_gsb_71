@@ -42,7 +42,8 @@ type ListQuery struct {
 	RoadName   string `form:"road_name"`
 	StartDate  string `form:"start_date"` // 上报日期起, 格式 YYYY-MM-DD
 	EndDate    string `form:"end_date"`   // 上报日期止, 格式 YYYY-MM-DD
-	OnlyOpen   bool   `form:"only_open"`  // 仅查询未闭环故障
+	OnlyOpen   bool   `form:"only_open"`  // 仅查询未闭环故障(待处理/维修中)
+	NotClosed  bool   `form:"not_closed"` // 仅查询未关闭故障(含已修复, 供补录历史维修选择)
 }
 
 // Meta 故障模块字典, 供前端渲染下拉框。

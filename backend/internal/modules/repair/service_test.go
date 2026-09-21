@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/require"
@@ -192,6 +193,79 @@ func TestRepairPendingPartsKeepsFaultProcessing(t *testing.T) {
 	faultAfterSecond, err := h.faults.GetByID(ctx, entity.ID)
 	require.NoError(t, err)
 	require.Equal(t, 2, faultAfterSecond.RepairCount)
+}
+
+func TestRepairBackfillKeepsLatestOccurrenceAndConclusion(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+	device := h.createLamp(t, "LD-T-005")
+	entity := h.createFault(t, device.ID, "补录历史维修记录的口径校验")
+
+	reported := entity.ReportedAt
+	layout := "2006-01-02 15:04:05"
+	startA := reported.Add(20 * time.Hour).Format(layout)
+	finishA := reported.Add(21 * time.Hour).Format(layout)
+	startB := reported.Add(2 * time.Hour).Format(layout)
+	finishB := reported.Add(3 * time.Hour).Format(layout)
+
+	// 最近一次(发生时间)维修: 已修复, 故障形成"已修复"结论。
+	recordA, err := h.repairs.Create(ctx, repair.CreateRequest{
+		FaultID: entity.ID, Repairman: "维修工甲", StartedAt: startA,
+	})
+	require.NoError(t, err)
+	_, err = h.repairs.Finish(ctx, recordA.ID, repair.FinishRequest{
+		Result: repair.ResultFixed, FinishedAt: finishA,
+	})
+	require.NoError(t, err)
+
+	faultAfterA, err := h.faults.GetByID(ctx, entity.ID)
+	require.NoError(t, err)
+	require.Equal(t, fault.StatusRepaired, faultAfterA.Status)
+	require.Equal(t, 1, faultAfterA.RepairCount)
+	require.NotNil(t, faultAfterA.LatestRepairID)
+	require.Equal(t, recordA.ID, *faultAfterA.LatestRepairID)
+
+	// 补录一条发生时间更早、结果为待配件的历史维修。
+	recordB, err := h.repairs.Create(ctx, repair.CreateRequest{
+		FaultID: entity.ID, Repairman: "维修工乙", StartedAt: startB,
+	})
+	require.NoError(t, err, "已修复但未关闭的故障应允许补录维修记录")
+	_, err = h.repairs.Finish(ctx, recordB.ID, repair.FinishRequest{
+		Result: repair.ResultPendingParts, FinishedAt: finishB,
+	})
+	require.NoError(t, err)
+
+	faultAfterBackfill, err := h.faults.GetByID(ctx, entity.ID)
+	require.NoError(t, err)
+	require.Equal(t, 2, faultAfterBackfill.RepairCount, "补录后维修次数应累加")
+	require.NotNil(t, faultAfterBackfill.LatestRepairID)
+	require.Equal(t, recordA.ID, *faultAfterBackfill.LatestRepairID,
+		"最近一次维修应仍按发生时间取 recordA, 不能被后登记的 recordB 顶替")
+	require.Equal(t, fault.StatusRepaired, faultAfterBackfill.Status,
+		"补录更早的非已修复记录不能推翻已经形成的已修复结论")
+
+	// 处置时间线/维修过程按发生时间排序: B 在前, A 在后。
+	repairs, err := h.repairs.ListByFault(ctx, entity.ID)
+	require.NoError(t, err)
+	require.Len(t, repairs, 2)
+	require.Equal(t, recordB.ID, repairs[0].ID)
+	require.Equal(t, recordA.ID, repairs[1].ID)
+
+	// 删除补录的记录后, 结论与最近一次维修仍保持在 recordA 上。
+	require.NoError(t, h.repairs.Delete(ctx, recordB.ID))
+	faultAfterDeleteBackfill, err := h.faults.GetByID(ctx, entity.ID)
+	require.NoError(t, err)
+	require.Equal(t, 1, faultAfterDeleteBackfill.RepairCount)
+	require.Equal(t, recordA.ID, *faultAfterDeleteBackfill.LatestRepairID)
+	require.Equal(t, fault.StatusRepaired, faultAfterDeleteBackfill.Status)
+
+	// 删除真正的最近一次维修后, 故障状态按剩余记录(recordB 已删, 无记录)回到待处理。
+	require.NoError(t, h.repairs.Delete(ctx, recordA.ID))
+	faultAfterDeleteLatest, err := h.faults.GetByID(ctx, entity.ID)
+	require.NoError(t, err)
+	require.Equal(t, 0, faultAfterDeleteLatest.RepairCount)
+	require.Nil(t, faultAfterDeleteLatest.LatestRepairID)
+	require.Equal(t, fault.StatusPending, faultAfterDeleteLatest.Status)
 }
 
 func TestRepairRejectedOnClosedFault(t *testing.T) {

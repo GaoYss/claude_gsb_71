@@ -25,12 +25,10 @@ var repairSortSpec = pagination.SortSpec{
 	Default: "started_at",
 }
 
-// FaultPort 由故障登记模块实现, 维修模块通过它联动故障状态与路灯状态。
+// FaultPort 由故障登记模块实现, 维修模块通过它在维修记录变化后对账故障状态与路灯状态。
 type FaultPort interface {
 	GetByID(ctx context.Context, id uint) (*fault.Fault, error)
-	OnRepairStarted(ctx context.Context, faultID uint, repairID uint) error
-	OnRepairFinished(ctx context.Context, faultID uint, fixed bool) error
-	SyncRepairStats(ctx context.Context, faultID uint, repairCount int, latestRepairID *uint) error
+	SyncAfterRepairChange(ctx context.Context, faultID uint, snap fault.RepairSnapshot) error
 }
 
 // Service 承载维修记录录入的业务规则。
@@ -71,7 +69,7 @@ func (s *Service) ListByFault(ctx context.Context, faultID uint) ([]Repair, erro
 	return s.repo.ListByFault(ctx, faultID)
 }
 
-// Create 录入维修记录(维修开工), 并联动故障与路灯状态。
+// Create 录入维修记录(维修开工), 并按发生时间口径对账故障与路灯状态。
 func (s *Service) Create(ctx context.Context, req CreateRequest) (*Repair, error) {
 	target, err := s.faults.GetByID(ctx, req.FaultID)
 	if err != nil {
@@ -79,9 +77,6 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (*Repair, error
 	}
 	if target.Status == fault.StatusClosed {
 		return nil, apperr.Conflict("故障 %s 已关闭, 不允许再登记维修记录", target.FaultNo)
-	}
-	if target.Status == fault.StatusRepaired {
-		return nil, apperr.Conflict("故障 %s 已修复, 如需返修请先登记新的维修记录并重新开工", target.FaultNo)
 	}
 
 	ongoing, err := s.repo.GetOngoingByFault(ctx, target.ID)
@@ -125,8 +120,9 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (*Repair, error
 		return nil, err
 	}
 
-	// 开工后: 故障转为维修中, 路灯转为维修状态
-	if err := s.faults.OnRepairStarted(ctx, target.ID, entity.ID); err != nil {
+	// 按发生时间重算最近一次维修: 补录更早的历史记录不会改变既有处置结论,
+	// 仅当新记录确实成为最近一次维修(如返修)时, 故障状态才随之变化。
+	if err := s.syncFaultSnapshot(ctx, target.ID); err != nil {
 		return nil, err
 	}
 
@@ -180,11 +176,16 @@ func (s *Service) Update(ctx context.Context, id uint, req UpdateRequest) (*Repa
 	if err := s.repo.Update(ctx, entity); err != nil {
 		return nil, err
 	}
+	// 开工时间等字段变化可能改变"最近一次维修"的归属, 需重新对账。
+	if err := s.syncFaultSnapshot(ctx, entity.FaultID); err != nil {
+		return nil, err
+	}
 	entity.FillDuration()
 	return entity, nil
 }
 
-// Finish 完成维修: 记录结果与完工时间, 结果为已修复时联动故障转为已修复。
+// Finish 完成维修: 记录结果与完工时间, 再按发生时间口径对账故障状态。
+// 是否"已修复"只取决于最近一次维修的结论: 补录并完工一条更早的记录不会推翻既有结论。
 func (s *Service) Finish(ctx context.Context, id uint, req FinishRequest) (*Repair, error) {
 	entity, err := s.repo.GetByID(ctx, id)
 	if err != nil {
@@ -227,7 +228,7 @@ func (s *Service) Finish(ctx context.Context, id uint, req FinishRequest) (*Repa
 		return nil, err
 	}
 
-	if err := s.faults.OnRepairFinished(ctx, entity.FaultID, result == ResultFixed); err != nil {
+	if err := s.syncFaultSnapshot(ctx, entity.FaultID); err != nil {
 		return nil, err
 	}
 
@@ -253,21 +254,30 @@ func (s *Service) Delete(ctx context.Context, id uint) error {
 		return err
 	}
 
-	count, err := s.repo.CountByFault(ctx, entity.FaultID)
+	return s.syncFaultSnapshot(ctx, entity.FaultID)
+}
+
+// syncFaultSnapshot 重算某条故障的维修统计快照并对账故障与路灯状态。
+// "最近一次维修"取开工时间(发生时间)最近的一条, 与处置时间线、维修列表同口径。
+func (s *Service) syncFaultSnapshot(ctx context.Context, faultID uint) error {
+	count, err := s.repo.CountByFault(ctx, faultID)
 	if err != nil {
 		return err
 	}
-	latest, err := s.repo.LatestByFault(ctx, entity.FaultID)
+	latest, err := s.repo.LatestByFault(ctx, faultID)
 	if err != nil {
 		return err
-	}
-	var latestID *uint
-	if latest != nil {
-		latestID = &latest.ID
 	}
 
-	if err := s.faults.SyncRepairStats(ctx, entity.FaultID, int(count), latestID); err != nil {
-		slog.Warn("同步故障维修统计失败", "fault_id", entity.FaultID, "error", err)
+	snap := fault.RepairSnapshot{Count: int(count)}
+	if latest != nil {
+		snap.LatestID = &latest.ID
+		snap.LatestOngoing = latest.Status == StatusOngoing
+		snap.LatestFixed = latest.Status == StatusFinished && latest.Result == ResultFixed
+	}
+
+	if err := s.faults.SyncAfterRepairChange(ctx, faultID, snap); err != nil {
+		slog.Warn("同步故障维修统计失败", "fault_id", faultID, "error", err)
 	}
 	return nil
 }

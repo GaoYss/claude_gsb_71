@@ -2,7 +2,9 @@ package status_test
 
 import (
 	"context"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/require"
@@ -82,6 +84,57 @@ func (h *harness) createFault(t *testing.T, lampID uint, faultType string) *faul
 }
 
 func intPointer(value int) *int { return &value }
+
+func TestBackfilledRepairKeepsOccurrenceBasedLatest(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+	device := h.createLamp(t, "LD-S-201", "滨江路")
+	entity := h.createFault(t, device.ID, "灯不亮")
+
+	reported := entity.ReportedAt
+	layout := "2006-01-02 15:04:05"
+
+	// 发生时间最近的维修先登记并修复闭环。
+	first, err := h.repairs.Create(ctx, repair.CreateRequest{
+		FaultID: entity.ID, Repairman: "维修工甲",
+		StartedAt: reported.Add(20 * time.Hour).Format(layout),
+	})
+	require.NoError(t, err)
+	_, err = h.repairs.Finish(ctx, first.ID, repair.FinishRequest{
+		Result:     repair.ResultFixed,
+		FinishedAt: reported.Add(21 * time.Hour).Format(layout),
+	})
+	require.NoError(t, err)
+
+	// 补录一条更早的、未修复的历史维修。
+	backfilled, err := h.repairs.Create(ctx, repair.CreateRequest{
+		FaultID: entity.ID, Repairman: "维修工乙",
+		StartedAt: reported.Add(2 * time.Hour).Format(layout),
+	})
+	require.NoError(t, err)
+	_, err = h.repairs.Finish(ctx, backfilled.ID, repair.FinishRequest{
+		Result:     repair.ResultPendingParts,
+		FinishedAt: reported.Add(3 * time.Hour).Format(layout),
+	})
+	require.NoError(t, err)
+
+	// 路灯维度的最近一次维修仍按发生时间取后发生的 first(已修复)。
+	rows, total, _, err := h.status.Lamps(ctx, status.LampQuery{Keyword: device.Code})
+	require.NoError(t, err)
+	require.Equal(t, int64(1), total)
+	require.Equal(t, first.RepairNo, rows[0].RepairNo)
+	require.Equal(t, repair.ResultFixed, rows[0].RepairResult)
+
+	// 时间线按发生时间排序: 补录的维修节点在前。
+	track, err := h.status.Track(ctx, status.TrackQuery{FaultID: entity.ID})
+	require.NoError(t, err)
+	require.Len(t, track.Repairs, 2)
+	require.Equal(t, backfilled.ID, track.Repairs[0].ID)
+	require.Equal(t, first.ID, track.Repairs[1].ID)
+	require.Equal(t, "reported", track.Timeline[0].Stage)
+	require.Equal(t, "repair_started", track.Timeline[1].Stage)
+	require.Equal(t, backfilled.RepairNo, strings.TrimSpace(track.Timeline[1].Detail))
+}
 
 func TestOverviewAggregatesBusinessState(t *testing.T) {
 	ctx := context.Background()

@@ -15,7 +15,7 @@
           reserve-keyword
           :remote-method="searchFaults"
           :loading="faultLoading"
-          placeholder="输入故障单号 / 路灯编号搜索未闭环故障"
+          placeholder="输入故障单号 / 路灯编号搜索未关闭故障"
           style="width: 100%"
           @change="handleFaultChange"
         >
@@ -155,7 +155,7 @@ const rules = {
 async function searchFaults(keyword = '') {
   faultLoading.value = true
   try {
-    const data = await faultApi.list({ keyword, only_open: true, page: 1, page_size: 20 }, { silent: true })
+    const data = await faultApi.list({ keyword, not_closed: true, page: 1, page_size: 20 }, { silent: true })
     faultCandidates.value = data?.items ?? []
   } catch (error) {
     faultCandidates.value = []

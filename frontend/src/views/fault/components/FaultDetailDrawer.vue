@@ -21,6 +21,12 @@
           <el-descriptions-item label="上报人">{{ detail.fault.reporter || '-' }}</el-descriptions-item>
           <el-descriptions-item label="上报时间">{{ formatDateTime(detail.fault.reported_at) }}</el-descriptions-item>
           <el-descriptions-item label="维修次数">{{ detail.fault.repair_count }} 次</el-descriptions-item>
+          <el-descriptions-item v-if="latestRepair" label="最近一次维修" :span="2">
+            {{ latestRepair.repair_no }} · {{ latestRepair.repairman }} ·
+            <StatusTag :dict="REPAIR_STATUS" :value="latestRepair.status" />
+            <template v-if="latestRepair.result"> · {{ dictLabel(REPAIR_RESULT, latestRepair.result) }}</template>
+            · 开工 {{ formatDateTime(latestRepair.started_at) }}<template v-if="latestRepair.finished_at"> · 完工 {{ formatDateTime(latestRepair.finished_at) }}</template>
+          </el-descriptions-item>
           <el-descriptions-item label="故障描述" :span="2">{{ detail.fault.description || '-' }}</el-descriptions-item>
           <el-descriptions-item v-if="detail.fault.closed_at" label="关闭时间" :span="1">
             {{ formatDateTime(detail.fault.closed_at) }}
@@ -80,7 +86,7 @@
 </template>
 
 <script setup>
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import StatusTag from '@/components/common/StatusTag.vue'
 import { statusApi } from '@/api/status'
 import { FAULT_LEVEL, FAULT_SOURCE, FAULT_STATUS, REPAIR_RESULT, REPAIR_STATUS, RUN_STATUS, TIMELINE_STAGE, dictLabel, dictType } from '@/constants/dict'
@@ -95,6 +101,13 @@ defineEmits(['update:modelValue'])
 
 const loading = ref(false)
 const detail = ref({ fault: null, lamp: null, repairs: [], timeline: [] })
+
+// 最近一次维修与后端同口径: 维修过程按开工时间(发生时间)正序, 末条即最近一次,
+// 与处置时间线、维修状态查询保持一致, 不受补录登记先后影响。
+const latestRepair = computed(() => {
+  const repairs = detail.value.repairs ?? []
+  return repairs.length ? repairs[repairs.length - 1] : null
+})
 
 // 打开抽屉时按故障 ID 拉取完整处理链路。
 async function load() {

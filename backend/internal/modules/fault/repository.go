@@ -26,6 +26,7 @@ type Filter struct {
 	ReportedFrom *time.Time
 	ReportedTo   *time.Time
 	OnlyOpen     bool
+	NotClosed    bool
 }
 
 // Repository 负责故障登记的数据访问。
@@ -261,6 +262,9 @@ func applyFilter(statement *gorm.DB, filter Filter) *gorm.DB {
 	}
 	if filter.OnlyOpen {
 		statement = statement.Where("status IN ?", []string{StatusPending, StatusProcessing})
+	}
+	if filter.NotClosed {
+		statement = statement.Where("status <> ?", StatusClosed)
 	}
 	return statement
 }

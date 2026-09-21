@@ -245,63 +245,55 @@ func (s *Service) Metadata() *Meta {
 	}
 }
 
-// OnRepairStarted 维修开工: 故障进入维修中, 维修次数累加, 并同步路灯状态。
-func (s *Service) OnRepairStarted(ctx context.Context, faultID uint, repairID uint) error {
-	entity, err := s.repo.GetByID(ctx, faultID)
-	if err != nil {
-		return err
-	}
-	if !canTransitTo(entity.Status, StatusProcessing) {
-		return apperr.Conflict("故障 %s 当前状态为 %s, 不允许开工维修", entity.FaultNo, StatusLabel(entity.Status))
-	}
-
-	entity.Status = StatusProcessing
-	entity.RepairCount++
-	entity.LatestRepairID = &repairID
-
-	if err := s.repo.Update(ctx, entity); err != nil {
-		return err
-	}
-	return s.syncLampStatus(ctx, entity.LampID)
+// RepairSnapshot 是维修侧在维修记录发生变化后提供的故障维修现状快照。
+// "最近一次维修"统一按发生时间(开工时间 started_at DESC, id DESC)判定, 与处置时间线、
+// 维修记录列表、维修状态查询的口径保持一致, 不以登记先后(created_at)为准。
+type RepairSnapshot struct {
+	Count         int   // 该故障的维修记录总数
+	LatestID      *uint // 按发生时间最近的一次维修记录 ID, 无记录时为 nil
+	LatestOngoing bool  // 最近一次维修仍在进行中
+	LatestFixed   bool  // 最近一次维修已完工且处置结果为"已修复"
 }
 
-// OnRepairFinished 维修完成: 结果为已修复时故障转为已修复, 否则保持维修中。
-func (s *Service) OnRepairFinished(ctx context.Context, faultID uint, fixed bool) error {
-	entity, err := s.repo.GetByID(ctx, faultID)
-	if err != nil {
-		return err
-	}
-	if fixed {
-		if !canTransitTo(entity.Status, StatusRepaired) {
-			return apperr.Conflict("故障 %s 当前状态为 %s, 无法标记为已修复", entity.FaultNo, StatusLabel(entity.Status))
-		}
-		entity.Status = StatusRepaired
-		if err := s.repo.Update(ctx, entity); err != nil {
-			return err
-		}
-	}
-	return s.syncLampStatus(ctx, entity.LampID)
-}
-
-// SyncRepairStats 同步维修次数与最新维修记录, 删除维修记录后回退未开工状态。
-func (s *Service) SyncRepairStats(ctx context.Context, faultID uint, repairCount int, latestRepairID *uint) error {
+// SyncAfterRepairChange 在维修记录录入/完工/修改/删除后对账故障数据:
+// 重算维修次数与最近一次维修, 并按最近一次维修的结论对账故障状态与路灯状态。
+//
+// 关键约束: 补录发生时间更早的历史维修时, 最近一次维修不变, 故障状态保持原结论;
+// 已关闭的故障视为终态, 只回写统计数据, 状态不再被维修侧改动。
+func (s *Service) SyncAfterRepairChange(ctx context.Context, faultID uint, snap RepairSnapshot) error {
 	entity, err := s.repo.GetByID(ctx, faultID)
 	if err != nil {
 		return err
 	}
 
 	columns := map[string]any{
-		"repair_count":     repairCount,
-		"latest_repair_id": latestRepairID,
+		"repair_count":     snap.Count,
+		"latest_repair_id": snap.LatestID,
 	}
-	if repairCount == 0 && entity.Status == StatusProcessing {
-		columns["status"] = StatusPending
+	if entity.Status != StatusClosed {
+		columns["status"] = resolveStatusAfterRepair(snap)
 	}
 
 	if err := s.repo.UpdateColumns(ctx, faultID, columns); err != nil {
 		return err
 	}
 	return s.syncLampStatus(ctx, entity.LampID)
+}
+
+// resolveStatusAfterRepair 依据最近一次维修(发生时间口径)的结论推算故障状态:
+// 无记录回到待处理, 最近一次在修为维修中, 最近一次完工已修复为已修复,
+// 最近一次完工但未修复(待配件/观察中/无法修复)保持维修中等待后续处置。
+func resolveStatusAfterRepair(snap RepairSnapshot) string {
+	switch {
+	case snap.Count == 0 || snap.LatestID == nil:
+		return StatusPending
+	case snap.LatestOngoing:
+		return StatusProcessing
+	case snap.LatestFixed:
+		return StatusRepaired
+	default:
+		return StatusProcessing
+	}
 }
 
 // syncLampStatus 依据该路灯的故障分布重新计算并写回运行状态。
@@ -332,6 +324,7 @@ func buildFilter(query ListQuery) (Filter, error) {
 		LampID:     query.LampID,
 		RoadName:   strings.TrimSpace(query.RoadName),
 		OnlyOpen:   query.OnlyOpen,
+		NotClosed:  query.NotClosed,
 	}
 
 	if filter.Status != "" && !IsValidStatus(filter.Status) {
