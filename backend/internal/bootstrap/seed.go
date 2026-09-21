@@ -130,7 +130,14 @@ func seed(db *gorm.DB) error {
 		start, end := repairRanges[index][0], repairRanges[index][1]
 		columns := map[string]any{"repair_count": end - start}
 		if end > start {
-			columns["latest_repair_id"] = repairs[end-1].ID
+			// 最近一次维修按发生时间(开工时间)认定, 与运行期口径一致。
+			latest := repairs[start]
+			for _, record := range repairs[start+1 : end] {
+				if record.StartedAt.After(latest.StartedAt) {
+					latest = record
+				}
+			}
+			columns["latest_repair_id"] = latest.ID
 		}
 		if item.closed {
 			closedAt := now.Add(-item.reportedAgo / 2)

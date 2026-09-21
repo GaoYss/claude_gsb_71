@@ -245,8 +245,11 @@ func (s *Service) Metadata() *Meta {
 	}
 }
 
-// OnRepairStarted 维修开工: 故障进入维修中, 维修次数累加, 并同步路灯状态。
-func (s *Service) OnRepairStarted(ctx context.Context, faultID uint, repairID uint) error {
+// OnRepairStarted 维修开工: 故障进入维修中, 并同步路灯状态。
+// 维修次数与最近一次维修(repair_count / latest_repair_id)不在这里维护,
+// 统一由维修模块在记录落库后按发生时间口径重算写入(见 SyncRepairStats),
+// 避免补录发生时间更早的记录时, 统计字段被登记顺序带偏。
+func (s *Service) OnRepairStarted(ctx context.Context, faultID uint) error {
 	entity, err := s.repo.GetByID(ctx, faultID)
 	if err != nil {
 		return err
@@ -256,8 +259,6 @@ func (s *Service) OnRepairStarted(ctx context.Context, faultID uint, repairID ui
 	}
 
 	entity.Status = StatusProcessing
-	entity.RepairCount++
-	entity.LatestRepairID = &repairID
 
 	if err := s.repo.Update(ctx, entity); err != nil {
 		return err
@@ -266,6 +267,8 @@ func (s *Service) OnRepairStarted(ctx context.Context, faultID uint, repairID ui
 }
 
 // OnRepairFinished 维修完成: 结果为已修复时故障转为已修复, 否则保持维修中。
+// 调用前提: 完工记录是该故障按发生时间(started_at)的最近一次维修,
+// 由维修模块判定后调用; 补录的更早记录完工不应走到这里, 以免推翻已形成的处置结论。
 func (s *Service) OnRepairFinished(ctx context.Context, faultID uint, fixed bool) error {
 	entity, err := s.repo.GetByID(ctx, faultID)
 	if err != nil {
@@ -283,7 +286,9 @@ func (s *Service) OnRepairFinished(ctx context.Context, faultID uint, fixed bool
 	return s.syncLampStatus(ctx, entity.LampID)
 }
 
-// SyncRepairStats 同步维修次数与最新维修记录, 删除维修记录后回退未开工状态。
+// SyncRepairStats 同步维修次数与最近一次维修记录, 并在次数归零时回退未开工状态。
+// 这是 repair_count / latest_repair_id 的唯一写入口: 由维修模块在新增/修改/删除记录后,
+// 按发生时间(started_at)口径重算传入, 保证补录乱序记录时统计口径不漂移。
 func (s *Service) SyncRepairStats(ctx context.Context, faultID uint, repairCount int, latestRepairID *uint) error {
 	entity, err := s.repo.GetByID(ctx, faultID)
 	if err != nil {
